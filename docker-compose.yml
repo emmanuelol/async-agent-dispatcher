@@ -1,0 +1,23 @@
+services:
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "6389:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 2s
+      timeout: 2s
+      retries: 10
+
+  test:
+    build: .
+    image: async-agent-dispatcher:latest
+    environment:
+      - REDIS_URL=redis://redis:6379/0
+      - PYTHONUNBUFFERED=1
+    depends_on:
+      redis:
+        condition: service_healthy
+    volumes:
+      - ./tests:/app/tests:ro
+      - ./src/async_agent_dispatcher:/usr/local/lib/python3.11/site-packages/async_agent_dispatcher:ro
