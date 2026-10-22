@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "async-agent-dispatcher"
-version = "0.1.0"
+dynamic = ["version"]
 description = "SRE-hardened asynchronous task and agent dispatcher with RQ batch consolidation, atomic Redis locking, and two-tier DLQ."
 readme = "README.md"
 requires-python = ">=3.11"
@@ -22,6 +22,9 @@ dev = [
     "pytest-mock>=3.12.0",
     "fakeredis>=2.20.0",
 ]
+
+[tool.hatch.version]
+path = "src/async_agent_dispatcher/__init__.py"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/async_agent_dispatcher"]

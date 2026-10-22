@@ -12,6 +12,7 @@ from async_agent_dispatcher.locking import (
 from async_agent_dispatcher.worker import (
     run_job_module,
     run_agent_graph,
+    arun_agent_graph,
     BoundedStringIO,
     isolated_argv,
     JobExecutionError,
@@ -30,7 +31,7 @@ from async_agent_dispatcher.batch import (
     format_batch_job_id,
 )
 
-__version__ = "0.1.0"
+__version__ = "0.2.0"
 
 __all__ = [
     "job_lock",
@@ -40,6 +41,7 @@ __all__ = [
     "clear_redis_connection_cache",
     "run_job_module",
     "run_agent_graph",
+    "arun_agent_graph",
     "BoundedStringIO",
     "isolated_argv",
     "JobExecutionError",
