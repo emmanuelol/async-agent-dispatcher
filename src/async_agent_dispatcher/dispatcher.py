@@ -1,18 +1,29 @@
 import functools
+import hashlib
 import importlib.util
 import logging
 import os
 import re
+import uuid
 from dataclasses import dataclass
 from typing import Any, Callable, Dict, List, Optional, Set, Union
 from redis import Redis
 from rq import Queue, Retry
+from rq.exceptions import NoSuchJobError
 from rq.job import Job
 
 from async_agent_dispatcher.locking import get_redis_connection, clear_redis_connection_cache
 from async_agent_dispatcher.worker import run_job_module
 
 logger = logging.getLogger("async_agent_dispatcher.dispatcher")
+
+_RELEASE_LOCK = """
+if redis.call("get", KEYS[1]) == ARGV[1] then
+    return redis.call("del", KEYS[1])
+else
+    return 0
+end
+"""
 
 # Register fork handler for connection isolation across worker forks
 if hasattr(os, "register_at_fork"):
@@ -74,6 +85,12 @@ class AgentDispatcher:
             return decorator
         elif callable(name_or_func):
             name = getattr(name_or_func, "__name__", str(name_or_func))
+            qualname = getattr(name_or_func, "__qualname__", name)
+            if "<locals>" in qualname or name == "<lambda>":
+                logger.warning(
+                    f"Registering local/lambda function '{qualname}' may fail during RQ worker unpickling. "
+                    "Top-level module functions are recommended for distributed RQ execution."
+                )
             self._registry[name] = name_or_func
             return name_or_func
         else:
@@ -101,6 +118,8 @@ class AgentDispatcher:
         retry_max: Optional[int] = None,
         retry_intervals: Optional[List[int]] = None,
         on_failure: Optional[Callable[..., Any]] = None,
+        result_ttl: Optional[int] = None,
+        failure_ttl: Optional[int] = None,
         **kwargs: Any,
     ) -> EnqueueResult:
         """
@@ -112,75 +131,99 @@ class AgentDispatcher:
                 f"Target '{target}' is not authorized. Must be registered with dispatcher."
             )
 
+        registered_target = self._registry[target]
+        if isinstance(registered_target, str) and kwargs:
+            raise TypeError(
+                f"Module target '{target}' does not accept keyword arguments via enqueue(). "
+                "Pass CLI arguments as positional *args."
+            )
+
         redis_conn = self.get_redis()
         q_name = queue_name or self.default_queue_name
         q = Queue(q_name, connection=redis_conn)
 
         # Sanitize job_id for RQ validation requirements (alphanumeric, underscores, dashes)
-        clean_job_id = re.sub(r"[^a-zA-Z0-9_\-]", "_", str(job_id)) if job_id else None
+        clean_job_id = None
+        if job_id:
+            raw_id = str(job_id)
+            sanitized = re.sub(r"[^a-zA-Z0-9_\-]", "_", raw_id)
+            if sanitized != raw_id:
+                suffix = hashlib.sha256(raw_id.encode("utf-8")).hexdigest()[:8]
+                clean_job_id = f"{sanitized}_{suffix}"
+            else:
+                clean_job_id = sanitized
 
-        # Idempotency check and Zombie purge
-        if clean_job_id:
-            try:
-                existing_job = Job.fetch(clean_job_id, connection=redis_conn)
-                status = existing_job.get_status()
+        dedup_lock_key = f"job_enqueue_lock:{clean_job_id}" if clean_job_id else None
+        lock_token = uuid.uuid4().hex if clean_job_id else None
 
-                if status in {"queued", "started", "deferred", "finished"}:
-                    logger.info(f"Job {clean_job_id} already exists with status '{status}'. Deduplicated.")
-                    return EnqueueResult(
-                        job_id=clean_job_id,
-                        status=status,
-                        enqueued=False,
-                        message=f"Job {clean_job_id} already exists ({status})",
-                    )
-                elif status == "failed":
-                    logger.warning(
-                        f"Job {clean_job_id} previously failed. Purging from registry for clean retry."
-                    )
-                    existing_job.delete()
-            except Exception:
-                # Job not found in Redis, proceed to enqueue
-                pass
+        if dedup_lock_key and lock_token:
+            redis_conn.set(dedup_lock_key, lock_token, nx=True, ex=10)
 
-        max_retries = retry_max if retry_max is not None else self.default_retry_max
-        intervals = retry_intervals if retry_intervals is not None else self.default_retry_intervals
-        failure_cb = on_failure or self.on_failure
+        try:
+            # Idempotency check and Zombie purge
+            if clean_job_id:
+                try:
+                    existing_job = Job.fetch(clean_job_id, connection=redis_conn)
+                    status = existing_job.get_status()
 
-        enqueue_kwargs: Dict[str, Any] = {
-            "job_timeout": timeout or self.default_timeout,
-            "result_ttl": 86400,
-            "failure_ttl": 604800,
-        }
+                    if status in {"queued", "started", "deferred", "finished", "scheduled"}:
+                        logger.info(f"Job {clean_job_id} already exists with status '{status}'. Deduplicated.")
+                        return EnqueueResult(
+                            job_id=clean_job_id,
+                            status=status,
+                            enqueued=False,
+                            message=f"Job {clean_job_id} already exists ({status})",
+                        )
+                    elif status == "failed":
+                        logger.warning(
+                            f"Job {clean_job_id} previously failed. Purging from registry for clean retry."
+                        )
+                        existing_job.delete()
+                except NoSuchJobError:
+                    pass
 
-        if max_retries > 0:
-            enqueue_kwargs["retry"] = Retry(max=max_retries, interval=intervals)
-        if failure_cb:
-            enqueue_kwargs["on_failure"] = failure_cb
-        if clean_job_id:
-            enqueue_kwargs["job_id"] = clean_job_id
+            max_retries = retry_max if retry_max is not None else self.default_retry_max
+            intervals = retry_intervals if retry_intervals is not None else self.default_retry_intervals
+            failure_cb = on_failure or self.on_failure
 
-        registered_target = self._registry[target]
+            enqueue_kwargs: Dict[str, Any] = {
+                "timeout": timeout or self.default_timeout,
+                "result_ttl": result_ttl if result_ttl is not None else 86400,
+                "failure_ttl": failure_ttl if failure_ttl is not None else 604800,
+            }
 
-        # Dispatch via run_job_module if string module path, else direct callable
-        if isinstance(registered_target, str):
-            job = q.enqueue(
-                run_job_module,
-                registered_target,
-                *args,
-                **enqueue_kwargs,
+            if max_retries > 0:
+                enqueue_kwargs["retry"] = Retry(max=max_retries, interval=intervals)
+            if failure_cb:
+                enqueue_kwargs["on_failure"] = failure_cb
+            if clean_job_id:
+                enqueue_kwargs["job_id"] = clean_job_id
+
+            # Dispatch via run_job_module if string module path, else direct callable via enqueue_call
+            if isinstance(registered_target, str):
+                job = q.enqueue_call(
+                    func=run_job_module,
+                    args=(registered_target, *args),
+                    **enqueue_kwargs,
+                )
+            else:
+                job = q.enqueue_call(
+                    func=registered_target,
+                    args=args,
+                    kwargs=kwargs,
+                    **enqueue_kwargs,
+                )
+
+            logger.info(f"Enqueued '{target}' on queue '{q_name}' with job ID: {job.id}")
+            return EnqueueResult(
+                job_id=job.id,
+                status="queued",
+                enqueued=True,
+                message=f"Job {job.id} enqueued for {target}",
             )
-        else:
-            job = q.enqueue(
-                registered_target,
-                *args,
-                **enqueue_kwargs,
-                **kwargs,
-            )
-
-        logger.info(f"Enqueued '{target}' on queue '{q_name}' with job ID: {job.id}")
-        return EnqueueResult(
-            job_id=job.id,
-            status="queued",
-            enqueued=True,
-            message=f"Job {job.id} enqueued for {target}",
-        )
+        finally:
+            if dedup_lock_key and lock_token:
+                try:
+                    redis_conn.eval(_RELEASE_LOCK, 1, dedup_lock_key, lock_token)
+                except Exception:
+                    pass
