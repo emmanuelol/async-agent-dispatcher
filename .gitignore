@@ -29,3 +29,5 @@ ENV/
 *.tmp
 *.log
 data/
+.blacklist*
+

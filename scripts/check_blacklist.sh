@@ -4,9 +4,27 @@ set -euo pipefail
 TARGET_DIR="${1:-.}"
 echo "=== Scanning for blacklisted patterns in: $TARGET_DIR ==="
 
-PATTERN="TC-001|TC-002|Branch_ID|Client_Vault|Active_Branches|Drop_Zone|Archive_ID|Master_Sales_Data|\+521472|@paseo\.com|emmanuelol\.org|Silao|OPENCLAW_TOKEN|GEMINI_API_KEY|ODOO_PASSWORD|facturacion\.emmanuelol\.org|kiosk\.emmanuelol\.org"
+PATTERN="${BLACKLIST_REGEX:-}"
 
-MATCHES=$(grep -rnEi "$PATTERN" "$TARGET_DIR" --exclude-dir=.git --exclude-dir=.pytest_cache --exclude="*.txt" --exclude="check_blacklist.sh" 2>/dev/null || true)
+# Check for local gitignored blacklist file if env var is empty
+if [ -z "$PATTERN" ] && [ -f "$TARGET_DIR/.blacklist_patterns" ]; then
+  PATTERN=$(grep -v '^#' "$TARGET_DIR/.blacklist_patterns" | tr '\n' '|' | sed 's/|$//')
+elif [ -z "$PATTERN" ] && [ -f ".blacklist_patterns" ]; then
+  PATTERN=$(grep -v '^#' ".blacklist_patterns" | tr '\n' '|' | sed 's/|$//')
+fi
+
+# Fail closed if running in CI or REQUIRE_BLACKLIST=1 and no pattern configured
+if [ -z "$PATTERN" ]; then
+  if [ "${CI:-}" = "true" ] || [ "${REQUIRE_BLACKLIST:-0}" = "1" ]; then
+    echo "ERROR: BLACKLIST_REGEX is not configured in CI environment! Failing closed."
+    exit 1
+  else
+    echo "WARNING: No BLACKLIST_REGEX or .blacklist_patterns found. Skipping pattern scan in local development."
+    PATTERN="^__DO_NOT_MATCH_ANYTHING_EMPTY_DEFAULT__$"
+  fi
+fi
+
+MATCHES=$(grep -rnEi "$PATTERN" "$TARGET_DIR" --exclude-dir=.git --exclude-dir=.pytest_cache --exclude="*.txt" --exclude="check_blacklist.sh" --exclude=".blacklist_patterns" 2>/dev/null || true)
 
 if [ -n "$MATCHES" ]; then
   echo "SECURITY VIOLATION: Blacklisted strings detected!"
