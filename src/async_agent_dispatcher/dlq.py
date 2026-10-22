@@ -18,11 +18,38 @@ redis.call('HDEL', KEYS[2], ARGV[1])
 return 1
 """
 
-LUA_NACK_RETRY = """
-redis.call('LREM', KEYS[1], 1, ARGV[1])
-redis.call('HDEL', KEYS[3], ARGV[1])
-redis.call('LPUSH', KEYS[2], ARGV[1])
-return 1
+LUA_CLAIM_ITEM = """
+local item = redis.call('RPOPLPUSH', KEYS[1], KEYS[2])
+if not item then
+    return nil
+end
+local server_time = redis.call('TIME')
+local now = tonumber(server_time[1])
+redis.call('HSET', KEYS[3], item, now)
+return item
+"""
+
+LUA_NACK_OR_POISON = """
+local processing_key = KEYS[1]
+local queue_key = KEYS[2]
+local timer_key = KEYS[3]
+local attempts_key = KEYS[4]
+local malformed_key = KEYS[5]
+local item = ARGV[1]
+local max_attempts = tonumber(ARGV[2])
+
+redis.call('LREM', processing_key, 1, item)
+redis.call('HDEL', timer_key, item)
+
+local attempts = redis.call('HINCRBY', attempts_key, item, 1)
+if attempts >= max_attempts then
+    redis.call('HDEL', attempts_key, item)
+    redis.call('LPUSH', malformed_key, item)
+    return 0
+else
+    redis.call('LPUSH', queue_key, item)
+    return 1
+end
 """
 
 LUA_SWEEP_ORPHANS = """
@@ -60,10 +87,11 @@ return rescued
 # --- Tier 2: POSIX File-Backed DLQ with Inode Preservation ---
 
 def safe_append_jsonl_dlq(
-    payload: Dict[str, Any],
+    payload: Any,
     file_path: str,
     max_retries: int = 5,
     backoff: float = 0.05,
+    fsync: bool = False,
 ) -> bool:
     """
     Safely appends an undelivered task to a fallback JSONL DLQ file using
@@ -95,6 +123,8 @@ def safe_append_jsonl_dlq(
             try:
                 f.write(line)
                 f.flush()
+                if fsync:
+                    os.fsync(f.fileno())
                 return True
             finally:
                 try:
@@ -108,7 +138,7 @@ def safe_append_jsonl_dlq(
 
 def drain_jsonl_dlq(
     file_path: str,
-    consumer_fn: Callable[[Dict[str, Any]], bool],
+    consumer_fn: Callable[[Any], bool],
 ) -> Tuple[int, int]:
     """
     Drains a JSONL DLQ file using in-place truncation under exclusive lock.
@@ -137,12 +167,18 @@ def drain_jsonl_dlq(
                     continue
                 try:
                     entry = json.loads(stripped)
+                except json.JSONDecodeError:
+                    logger.error(f"Malformed JSONL line retained: {stripped}")
+                    retained_lines.append(line)
+                    continue
+
+                try:
                     if consumer_fn(entry):
                         success_count += 1
                     else:
                         retained_lines.append(line)
-                except json.JSONDecodeError:
-                    logger.error(f"Malformed JSONL line retained: {stripped}")
+                except Exception as e:
+                    logger.error(f"Consumer raised exception on DLQ entry: {e}")
                     retained_lines.append(line)
 
             # Inode-preserving rewrite
@@ -162,7 +198,7 @@ def drain_jsonl_dlq(
 class RedisDLQ:
     """
     Two-stage atomic Dead Letter Queue built on Redis.
-    Uses RPOPLPUSH, processing lease timers, and atomic Lua scripts
+    Uses atomic claim Lua scripts, processing lease timers, and retry-bounded poison isolation
     to guarantee zero lost tasks, crash resilience, and orphan rescue.
     """
     def __init__(
@@ -171,15 +207,18 @@ class RedisDLQ:
         redis_client: Optional[Redis] = None,
         redis_url: Optional[str] = None,
         orphan_timeout: int = 60,
+        max_attempts: int = 3,
     ):
         self.topic = topic
         self._redis_client = redis_client
         self._redis_url = redis_url or os.getenv("REDIS_URL", "redis://localhost:6379/0")
         self.orphan_timeout = orphan_timeout
+        self.max_attempts = max_attempts
 
         self.queue_key = f"dlq:{topic}"
         self.processing_key = f"dlq:{topic}:processing"
         self.timer_key = f"dlq:{topic}:processing:timers"
+        self.attempts_key = f"dlq:{topic}:attempts"
         self.malformed_key = f"dlq:{topic}:malformed"
 
     def get_redis(self) -> Redis:
@@ -187,10 +226,19 @@ class RedisDLQ:
             return self._redis_client
         return get_redis_connection(self._redis_url)
 
-    def push(self, payload: Union[Dict[str, Any], str]) -> int:
-        """Push an undeliverable payload into the DLQ."""
+    def push(self, payload: Any, max_payload_bytes: Optional[int] = None) -> int:
+        """Push an undeliverable payload into the DLQ with JSON validation and payload limits."""
         r = self.get_redis()
-        serialized = json.dumps(payload) if isinstance(payload, dict) else str(payload)
+        if isinstance(payload, str):
+            serialized = payload
+        else:
+            serialized = json.dumps(payload, ensure_ascii=False)
+
+        payload_size = len(serialized.encode("utf-8"))
+        limit = max_payload_bytes if max_payload_bytes is not None else 5_000_000
+        if payload_size > limit:
+            raise ValueError(f"Payload size ({payload_size} bytes) exceeds limit of {limit} bytes.")
+
         return r.lpush(self.queue_key, serialized)
 
     def rescue_orphans(self, timeout_seconds: Optional[int] = None) -> int:
@@ -217,7 +265,7 @@ class RedisDLQ:
 
     def drain(
         self,
-        consumer_fn: Callable[[Dict[str, Any]], bool],
+        consumer_fn: Callable[[Any], bool],
         batch_size: Optional[int] = None,
     ) -> Tuple[int, int]:
         """
@@ -238,36 +286,61 @@ class RedisDLQ:
         failed_count = 0
 
         for _ in range(limit):
-            raw_item = r.rpoplpush(self.queue_key, self.processing_key)
+            # Atomic claim item and stamp timer in a single Lua operation
+            raw_item = r.eval(
+                LUA_CLAIM_ITEM,
+                3,
+                self.queue_key,
+                self.processing_key,
+                self.timer_key,
+            )
             if not raw_item:
                 break
 
             item_str = raw_item.decode("utf-8") if isinstance(raw_item, bytes) else str(raw_item)
-            current_time = r.time()[0]
-            r.hset(self.timer_key, item_str, current_time)
 
             try:
                 payload = json.loads(item_str)
+            except json.JSONDecodeError as e:
+                logger.error(f"Malformed non-JSON DLQ entry quarantined: {e}")
+                r.lpush(self.malformed_key, item_str)
+                r.eval(LUA_ACK_SUCCESS, 2, self.processing_key, self.timer_key, item_str)
+                failed_count += 1
+                continue
+
+            try:
                 success = consumer_fn(payload)
                 if success:
                     success_count += 1
                     r.eval(LUA_ACK_SUCCESS, 2, self.processing_key, self.timer_key, item_str)
+                    r.hdel(self.attempts_key, item_str)
                 else:
                     failed_count += 1
                     r.eval(
-                        LUA_NACK_RETRY,
-                        3,
+                        LUA_NACK_ORPOISON if False else LUA_NACK_OR_POISON,
+                        5,
                         self.processing_key,
                         self.queue_key,
                         self.timer_key,
+                        self.attempts_key,
+                        self.malformed_key,
                         item_str,
+                        self.max_attempts,
                     )
             except Exception as e:
-                logger.error(f"Malformed DLQ entry or unhandled consumer failure: {e}")
-                # Move to malformed and ACK from processing
-                r.lpush(self.malformed_key, item_str)
-                r.eval(LUA_ACK_SUCCESS, 2, self.processing_key, self.timer_key, item_str)
+                logger.error(f"Unhandled consumer exception on DLQ entry: {e}")
                 failed_count += 1
+                r.eval(
+                    LUA_NACK_OR_POISON,
+                    5,
+                    self.processing_key,
+                    self.queue_key,
+                    self.timer_key,
+                    self.attempts_key,
+                    self.malformed_key,
+                    item_str,
+                    self.max_attempts,
+                )
 
         return success_count, failed_count
 

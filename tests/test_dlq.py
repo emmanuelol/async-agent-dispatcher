@@ -117,3 +117,58 @@ def test_redis_dlq_orphan_rescue(redis_client):
     assert rescued == 1
     assert dlq.length() == 1
     assert dlq.processing_length() == 0
+
+
+def test_redis_dlq_push_list_and_max_payload(redis_client):
+    dlq = RedisDLQ(topic="payload_topic", redis_client=redis_client)
+    # List serialization
+    dlq.push([1, 2, 3])
+    success_cnt, _ = dlq.drain(lambda p: isinstance(p, list) and p == [1, 2, 3])
+    assert success_cnt == 1
+
+    # Max payload limit exceeded
+    with pytest.raises(ValueError) as exc:
+        dlq.push("A" * 100, max_payload_bytes=50)
+    assert "exceeds limit" in str(exc.value)
+
+
+def test_redis_dlq_poison_pill_quarantine(redis_client):
+    dlq = RedisDLQ(topic="poison_topic", redis_client=redis_client, max_attempts=2)
+    dlq.push({"id": "poison_item"})
+
+    # Always fail
+    def failing_consumer(payload):
+        return False
+
+    # Attempt 1 -> NACKed back to queue
+    s1, f1 = dlq.drain(failing_consumer)
+    assert s1 == 0 and f1 == 1
+    assert dlq.length() == 1
+
+    # Attempt 2 -> hits max_attempts, moved to malformed
+    s2, f2 = dlq.drain(failing_consumer)
+    assert s2 == 0 and f2 == 1
+    assert dlq.length() == 0
+    # Verified in malformed list
+    assert redis_client.llen(dlq.malformed_key) == 1
+
+
+def test_drain_jsonl_consumer_exception_retains_line(tmp_path):
+    queue_file = str(tmp_path / "exc_dlq.jsonl")
+    assert safe_append_jsonl_dlq({"id": 1}, queue_file)
+    assert safe_append_jsonl_dlq({"id": 2}, queue_file)
+
+    def consumer(payload):
+        if payload["id"] == 1:
+            return True
+        raise RuntimeError("Transient DB error on item 2")
+
+    success_cnt, retained_cnt = drain_jsonl_dlq(queue_file, consumer)
+    assert success_cnt == 1
+    assert retained_cnt == 1
+
+    with open(queue_file, "r") as f:
+        remaining = [json.loads(line) for line in f]
+    assert len(remaining) == 1
+    assert remaining[0]["id"] == 2
+
