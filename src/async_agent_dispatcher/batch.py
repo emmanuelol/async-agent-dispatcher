@@ -19,12 +19,14 @@ def format_batch_job_id(
     window: Union[str, datetime.date, datetime.datetime],
 ) -> str:
     """
-    Generate deterministic idempotency key for Vault 102 batch fan-out.
+    Generate deterministic idempotency key for batch fan-out.
     Format: {job_name}_{entity_id}_{window}
     """
     clean_job = sanitize_key_component(job_name)
     clean_entity = sanitize_key_component(entity_id)
-    if isinstance(window, (datetime.date, datetime.datetime)):
+    if isinstance(window, datetime.datetime):
+        clean_window = window.strftime("%Y-%m-%dT%H-%M-%S")
+    elif isinstance(window, datetime.date):
         clean_window = window.strftime("%Y-%m-%d")
     else:
         clean_window = sanitize_key_component(window)
@@ -34,7 +36,7 @@ def format_batch_job_id(
 
 class BatchDispatcher:
     """
-    Vault 102 Batch Fan-Out Dispatcher.
+    Batch Fan-Out Dispatcher.
     Replaces brittle in-process multi-tenant loops with isolated per-entity RQ jobs.
     Guarantees deterministic idempotency across retries and prevents head-of-line blocking.
     """
@@ -50,6 +52,7 @@ class BatchDispatcher:
         kwarg_builder: Optional[Callable[[str], Dict[str, Any]]] = None,
         timeout: Optional[int] = None,
         queue_name: Optional[str] = None,
+        result_ttl: Optional[int] = None,
     ) -> Dict[str, EnqueueResult]:
         """
         Dispatches an isolated job for each entity in the batch.
@@ -70,6 +73,7 @@ class BatchDispatcher:
                     job_id=job_id,
                     timeout=timeout,
                     queue_name=queue_name,
+                    result_ttl=result_ttl,
                     **kwargs,
                 )
                 results[entity] = result

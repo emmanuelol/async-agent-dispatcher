@@ -15,6 +15,18 @@ def test_format_batch_job_id():
     assert job_id == "data_sync_tenant_a_2026-10-13"
 
 
+def test_format_batch_job_id_datetime_preserves_time():
+    import datetime
+    dt = datetime.datetime(2026, 10, 13, 14, 30, 0)
+    d = datetime.date(2026, 10, 13)
+    id_dt = format_batch_job_id("data_sync", "tenant_a", dt)
+    id_d = format_batch_job_id("data_sync", "tenant_a", d)
+    assert id_dt != id_d
+    assert "14-30" in id_dt
+    assert id_d == "data_sync_tenant_a_2026-10-13"
+
+
+
 def test_batch_dispatch_isolation_and_idempotency(redis_client):
     dispatcher = AgentDispatcher(redis_client=redis_client)
 
