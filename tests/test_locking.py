@@ -66,3 +66,36 @@ def test_execution_lock_context_manager(redis_client):
 
     # Released after context exit
     assert redis_client.get(key) is None
+
+
+def test_get_redis_connection_caches_by_url():
+    from async_agent_dispatcher.locking import get_redis_connection, clear_redis_connection_cache
+    clear_redis_connection_cache()
+    url = "redis://127.0.0.1:6399/1"
+    conn1 = get_redis_connection(url)
+    conn2 = get_redis_connection(url)
+    assert conn1 is conn2
+    clear_redis_connection_cache()
+
+
+def test_cas_release_warning_on_lock_loss(redis_client, caplog):
+    import logging
+    key = "joblock:loss_task"
+    with caplog.at_level(logging.WARNING):
+        with execution_lock("loss_task", ttl=1, redis_client=redis_client) as token:
+            # Overwrite lock key simulating expiration and reassignment
+            redis_client.set(key, "stolen_token")
+    assert any("release failed" in record.message for record in caplog.records)
+
+
+def test_auto_renew_watchdog(redis_client):
+    import time
+    key = "joblock:renew_task"
+    with execution_lock("renew_task", ttl=2, redis_client=redis_client, auto_renew=True, renew_interval=0.5):
+        # Sleep longer than original TTL to verify renewal kept it alive
+        time.sleep(2.5)
+        assert redis_client.get(key) is not None
+        ttl_left = redis_client.ttl(key)
+        assert ttl_left > 0
+    assert redis_client.get(key) is None
+
