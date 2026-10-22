@@ -5,7 +5,7 @@
 [![License: MIT](https://img.shields.io/badge/license-MIT-green.svg)](LICENSE)
 [![Zero-Trust Audited](https://img.shields.io/badge/security-clean--room%20verified-blueviolet.svg)](scripts/)
 
-**Production-grade distributed task dispatching, atomic Redis locking, bounded-memory worker sandboxes, and two-tier Dead Letter Queue (DLQ) primitives for autonomous AI agent pipelines.**
+**Production-grade distributed task dispatching, atomic Redis locking with watchdog auto-renewal, bounded-memory worker sandboxes, and two-tier Dead Letter Queue (DLQ) primitives for autonomous AI agent pipelines.**
 
 Most AI agent frameworks focus on prompt chaining and orchestration while neglecting infrastructure failure modes under real production load: runaway agent logs trigger host container Out-Of-Memory (OOM) kills, retry storms duplicate expensive multi-step LLM operations, and transient network partitions silently drop mission-critical tasks. 
 
@@ -17,13 +17,13 @@ Most AI agent frameworks focus on prompt chaining and orchestration while neglec
 
 | Production Failure Mode | Root Cause in Standard Stacks | How `async-agent-dispatcher` Solves It | Core Module |
 | :--- | :--- | :--- | :--- |
-| **Duplicate Agent Runs** | Cron retries, double webhook deliveries, or parallel worker triggers. | Declarative job registration with deterministic job IDs and deduplication across active states (`queued`, `started`, `deferred`, `finished`). | [`dispatcher.py`](src/async_agent_dispatcher/dispatcher.py) |
-| **Concurrent State Collisions** | Multiple distributed workers executing mutual exclusive tasks simultaneously. | Distributed execution lock with atomic Lua CAS release script (`_RELEASE`) preventing foreign lock eviction upon TTL expiry. | [`locking.py`](src/async_agent_dispatcher/locking.py) |
+| **Duplicate Agent Runs** | Cron retries, double webhook deliveries, or parallel worker triggers. | Declarative job registration with deterministic job IDs and deduplication across active states (`queued`, `started`, `deferred`, `finished`, `scheduled`) within `result_ttl`. | [`dispatcher.py`](src/async_agent_dispatcher/dispatcher.py) |
+| **Concurrent State Collisions & Lock Expiry** | Multiple distributed workers executing mutual exclusive tasks simultaneously or tasks exceeding TTL. | Distributed execution lock with atomic Lua CAS release (`_RELEASE`) and optional background heartbeat watchdog auto-renewal (`auto_renew=True`). | [`locking.py`](src/async_agent_dispatcher/locking.py) |
 | **Worker OOM Crashes** | Unbounded stdout/stderr from verbose model traces or recursive agent reasoning loops. | Subprocess stream isolation with `BoundedStringIO` enforcing a hard 5MB memory ceiling with automated truncation notices. | [`worker.py`](src/async_agent_dispatcher/worker.py) |
 | **Redis Socket Corruption** | Python worker processes inheriting open Redis socket file descriptors across forks. | Automatic Redis connection pool eviction registered at process boundary via `os.register_at_fork`. | [`locking.py`](src/async_agent_dispatcher/locking.py) |
 | **Dropped Tasks on Worker Crash** | Tasks unacknowledged when worker dies or gets killed mid-execution. | Tier-1 Redis DLQ: atomic `RPOPLPUSH` with lease timers and clock-skew-free orphan recovery using Redis server time. | [`dlq.py`](src/async_agent_dispatcher/dlq.py) |
 | **Unlinked Inode Race Condition** | `os.replace` on active queue files destroying writes from concurrent worker threads. | Tier-2 File DLQ: in-place `a+` truncate-and-drain under POSIX `fcntl.flock(LOCK_EX)` guaranteeing live inode preservation. | [`dlq.py`](src/async_agent_dispatcher/dlq.py) |
-| **Head-of-Line Partition Blocking** | Monolithic loops where a timeout in Entity A halts execution for Entity B through Z. | Vault 102 Fan-Out Batch Dispatcher generating isolated, idempotent partitions (`{job}_{entity}_{window}`). | [`batch.py`](src/async_agent_dispatcher/batch.py) |
+| **Head-of-Line Partition Blocking** | Monolithic loops where a timeout in Entity A halts execution for Entity B through Z. | Partitioned Fan-Out Batch Dispatcher generating isolated, idempotent partitions (`{job}_{entity}_{window}`). | [`batch.py`](src/async_agent_dispatcher/batch.py) |
 
 ---
 
@@ -61,26 +61,27 @@ flowchart TD
 ```text
 async-agent-dispatcher/
 ├── src/async_agent_dispatcher/
-│   ├── __init__.py       # Public API re-exports
-│   ├── batch.py          # Vault 102 idempotent fan-out batch dispatcher
+│   ├── __init__.py       # Public API re-exports & __version__ = "0.2.0"
+│   ├── batch.py          # Deterministic fan-out batch dispatcher
 │   ├── dispatcher.py     # AgentDispatcher with job deduplication & zombie purging
 │   ├── dlq.py            # Two-tier Dead Letter Queue (Redis Lua state machine + POSIX flock)
-│   ├── locking.py        # Distributed mutual exclusion (@job_lock, execution_lock)
-│   └── worker.py         # Sandboxed execution (BoundedStringIO, isolated_argv)
+│   ├── locking.py        # Distributed mutual exclusion (@job_lock, execution_lock, auto-renew)
+│   └── worker.py         # Sandboxed execution (BoundedStringIO, isolated_argv, arun_agent_graph)
 ├── tests/                # 100% containerized integration test suite
-│   ├── conftest.py       # Live Redis / FakeRedis fixtures
-│   ├── test_batch.py     # Partitioning & idempotency tests
+│   ├── conftest.py       # Live Redis / FakeRedis fixtures with fail-closed checks
+│   ├── test_batch.py     # Partitioning & datetime idempotency tests
 │   ├── test_dispatcher.py# Enqueue, authorization & deduplication tests
 │   ├── test_dlq.py       # Inode preservation concurrency & Lua orphan rescue tests
+│   ├── test_e2e_worker.py# End-to-end SimpleWorker execution tests
 │   ├── test_locking.py   # Mutex collision & atomic Lua CAS release tests
-│   └── test_worker.py    # Memory ceiling & argv isolation tests
+│   └── test_worker.py    # Memory ceiling, argv isolation & async graph tests
 ├── scripts/
 │   ├── audit_image.sh    # Multi-stage container security & Trivy vulnerability scan
 │   └── check_blacklist.sh# Static clean-room token & secret leakage verification
 ├── Dockerfile            # Hardened multi-stage non-root runtime image
 ├── docker-compose.yml    # Redis 7 Alpine + test runner orchestration
 ├── Makefile              # Standardized developer onboarding targets
-└── pyproject.toml        # PEP 621 package metadata
+└── pyproject.toml        # PEP 621 package metadata with dynamic versioning
 ```
 
 ---
@@ -96,7 +97,7 @@ pip install async-agent-dispatcher
 Or install from git pin:
 
 ```bash
-pip install "async-agent-dispatcher @ git+https://github.com/emmanuelol/async-agent-dispatcher.git@v0.1.0"
+pip install "async-agent-dispatcher @ git+https://github.com/emmanuelol/async-agent-dispatcher.git@v0.2.0"
 ```
 
 ### 1. Declarative Task Registration & Idempotent Dispatch
@@ -119,22 +120,23 @@ result = dispatcher.enqueue(
     "e37256c",
     job_id="audit_repo_e37256c",
     timeout=180,
-    retry_max=3
+    retry_max=3,
+    result_ttl=86400  # Idempotency retention window in seconds
 )
 
 print(result)
 # EnqueueResult(job_id='audit_repo_e37256c', status='queued', enqueued=True, message='...')
 ```
 
-### 2. Distributed Execution Mutual Exclusion
+### 2. Distributed Execution Mutual Exclusion & Watchdog Renewal
 
 ```python
 from async_agent_dispatcher import job_lock, execution_lock, JobAlreadyRunning
 
-# Decorator form: ensures only one worker executes this job across the cluster
-@job_lock("financial_sync", ttl=300)
+# Decorator form with auto-renewal watchdog for long-running agent tasks
+@job_lock("financial_sync", ttl=300, auto_renew=True)
 def sync_financials():
-    # Critical section protected by Redis CAS token
+    # Background watchdog extends lock TTL periodically until task completes
     pass
 
 # Context manager form:
@@ -147,7 +149,7 @@ except JobAlreadyRunning:
     print("Nightly digest is already executing on another node.")
 ```
 
-### 3. Vault 102 Deterministic Fan-Out Batching
+### 3. Deterministic Fan-Out Batching
 
 ```python
 from async_agent_dispatcher import AgentDispatcher, BatchDispatcher
@@ -164,20 +166,35 @@ batch = BatchDispatcher(dispatcher)
 results = batch.dispatch_batch(
     target="tasks.partition_sync",
     entities=["tenant_alpha", "tenant_beta", "tenant_gamma"],
-    window="2026-10-13"
+    window="2026-10-13",
+    result_ttl=86400
 )
 
 for entity, res in results.items():
     print(f"{entity}: {res.status} (Job ID: {res.job_id})")
 ```
 
-### 4. Two-Tier Dead Letter Queue (DLQ)
+### 4. Native Synchronous & Asynchronous Agent Graphs
+
+```python
+from async_agent_dispatcher import run_agent_graph, arun_agent_graph
+
+# Synchronous invocation
+result = run_agent_graph("my_agent_module", {"user_query": "Summarize logs"})
+
+# Asynchronous invocation (supports ainvoke or async coroutines)
+async def main():
+    res = await arun_agent_graph("my_agent_module", {"user_query": "Summarize logs"})
+    print(res)
+```
+
+### 5. Two-Tier Dead Letter Queue (DLQ)
 
 ```python
 from async_agent_dispatcher import RedisDLQ, safe_append_jsonl_dlq, drain_jsonl_dlq
 
-# Tier 1: Redis DLQ with atomic orphan rescue & lease timers
-dlq = RedisDLQ(topic="agent_alerts", redis_url="redis://localhost:6379/0")
+# Tier 1: Redis DLQ with atomic claim Lua, orphan rescue & max attempt poison isolation
+dlq = RedisDLQ(topic="agent_alerts", redis_url="redis://localhost:6379/0", max_attempts=3)
 
 # Push undeliverable task
 dlq.push({"target": "ops_channel", "alert": "High Error Rate", "retry_count": 3})
@@ -205,7 +222,7 @@ This repository adheres to strict clean-room standards with zero internal creden
 
 ### Run Integration Tests in Docker
 
-Spins up `redis:7-alpine` and executes 22 concurrency, locking, and DLQ tests:
+Spins up `redis:7-alpine` and executes 36 concurrency, locking, batch, worker, and DLQ integration tests:
 
 ```bash
 make test
