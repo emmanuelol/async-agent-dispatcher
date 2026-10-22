@@ -65,3 +65,45 @@ def test_run_job_module_failure(tmp_path, monkeypatch):
     with pytest.raises(JobExecutionError) as exc_info:
         run_job_module("failing_module")
     assert "ValueError" in str(exc_info.value)
+
+
+def test_run_agent_graph_falsy_object():
+    class FalsyGraph:
+        def __len__(self):
+            return 0  # truthiness is False
+
+        def invoke(self, state):
+            return {"received": state}
+
+    graph = FalsyGraph()
+    res = run_agent_graph(graph, {"key": "val"})
+    assert res == {"received": {"key": "val"}}
+
+
+@pytest.mark.asyncio
+async def test_arun_agent_graph():
+    from async_agent_dispatcher.worker import arun_agent_graph
+
+    class AsyncGraph:
+        async def ainvoke(self, state):
+            return {"async_status": "done", "val": state.get("x")}
+
+    graph = AsyncGraph()
+    res = await arun_agent_graph(graph, {"x": 100})
+    assert res == {"async_status": "done", "val": 100}
+
+
+def test_run_job_module_concurrency_guard(tmp_path, monkeypatch):
+    import threading
+    from async_agent_dispatcher.worker import _job_execution_lock
+
+    script = tmp_path / "concurrent_mod.py"
+    script.write_text("print('test')\n")
+    monkeypatch.syspath_prepend(str(tmp_path))
+
+    # Manually hold lock to simulate another thread executing run_job_module
+    with _job_execution_lock:
+        with pytest.raises(RuntimeError) as exc_info:
+            run_job_module("concurrent_mod")
+        assert "incompatible with concurrent" in str(exc_info.value)
+
